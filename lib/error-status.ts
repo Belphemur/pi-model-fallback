@@ -16,6 +16,13 @@ export function parseReasonFromErrorMessage(message: string): string | undefined
 }
 
 export function parseStatusFromErrorMessage(message: string): number | undefined {
+  if (/provider returned an empty response/i.test(message)) {
+    // Providers (notably OpenRouter stealth/pool models) can complete the HTTP
+    // request with 200 but stream nothing — the harness records stopReason "error"
+    // with this literal text and no numeric status. Synthesize 502 so status-based
+    // fallback rules fire instead of the agent silently retrying the same model.
+    return 502;
+  }
   const patterns: RegExp[] = [
     // Leading bare status code, optionally prefixed with "Error:", e.g. "401: {\"type\":\"CreditsError\"...}"
     // or "Error: 401: {\"type\":\"CreditsError\"...}" (OpenCode Go, OpenRouter relays)

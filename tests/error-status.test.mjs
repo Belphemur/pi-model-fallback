@@ -47,6 +47,16 @@ test("parseStatusFromErrorMessage extracts a bare status followed by a quota nou
   assert.equal(parseStatusFromErrorMessage("403 quota exhausted for this month"), 403);
 });
 
+test("parseStatusFromErrorMessage synthesizes 502 for empty-provider responses", () => {
+  // OpenRouter stealth/pool models can complete the HTTP request with 200 but
+  // stream nothing; the harness surfaces the literal text with no numeric
+  // status. Without the synthesis the agent retries the same dead model.
+  assert.equal(parseStatusFromErrorMessage("Provider returned an empty response"), 502);
+  assert.equal(parseStatusFromErrorMessage("provider returned an empty response after 30s"), 502);
+  // Prose containing neither the phrase nor a status stays unmatched.
+  assert.equal(parseStatusFromErrorMessage("429 tokens remaining in context window"), undefined);
+});
+
 test("parseStatusFromErrorMessage ignores unrelated 3-digit numbers", () => {
   assert.equal(parseStatusFromErrorMessage("429 tokens remaining in context window"), undefined);
   assert.equal(parseStatusFromErrorMessage("processed 404 items before retry"), undefined);
