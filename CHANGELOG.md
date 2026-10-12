@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Recognize Anthropic SDK status-plus-JSON and streaming errors so configured rate-limit and outage rules are evaluated. Treat interrupted Anthropic streams as `502` and supported connection failures as `503`, without changing rule defaults or matching cancellation.
+
 ## [0.5.2] - 2026-10-07
 
 ### Changed
