@@ -24,13 +24,14 @@ async function createHarness({ rules = [rule(SOURCE, FALLBACK)], autoRetry = tru
   if (preselect) await writeFile(join(root, "state.json"), JSON.stringify({ version: 1, entries: [{ source: SOURCE, fallback: FALLBACK, status: 429, until: new Date(Date.now() + 3600000).toISOString(), createdAt: new Date().toISOString() }] }));
   const handlers = new Map();
   const calls = { models: [], prompts: [], notifications: [] };
+  const tools = new Map();
   let terminalInput;
   let ctx;
   let serial = 0;
   const entries = [{ type: "message", id: "user", message: { role: "user", content: "finish the existing work" } }];
   const pi = {
     on(type, handler) { handlers.set(type, handler); },
-    registerCommand() {}, registerTool() {},
+    registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); },
     async setModel(model) {
       if (switchModel && !(await switchModel(model))) return false;
       calls.models.push(model);
@@ -46,6 +47,7 @@ async function createHarness({ rules = [rule(SOURCE, FALLBACK)], autoRetry = tru
     modelRegistry: { find: (provider, id) => ({ provider, id }) },
     ui: {
       notify: (message, level) => calls.notifications.push({ message, level }), setStatus() {},
+      confirm: async () => true,
       onTerminalInput(handler) { terminalInput = handler; return () => { terminalInput = undefined; }; },
     },
     sessionManager: { getBranch: () => entries, getEntries: () => entries },
@@ -66,7 +68,7 @@ async function createHarness({ rules = [rule(SOURCE, FALLBACK)], autoRetry = tru
     assert.equal(typeof handler, "function", "fallback must use Pi's actionable settle boundary");
     return handler({ outcome, entries: [], continue: false, context: { contextEntries: entries.map(entry => ({ sourceEntry: entry, messages: [entry.message] })), pendingMessages: [], canContinue: false } }, ctx);
   }
-  return { calls, ctx, entries, handlers, fail, settle, start, escape: () => terminalInput?.("\u001b"), statePath: join(root, "state.json") };
+  return { calls, ctx, entries, handlers, fail, settle, start, tools, escape: () => terminalInput?.("\u001b"), statePath: join(root, "state.json") };
 }
 
 test("a failure switches only at settlement and continues without a second user request", async () => {
@@ -177,6 +179,16 @@ test("manual selection cancels pending fallback", async () => {
   await h.handlers.get("model_select")({ model: h.ctx.model, source: "set" }, h.ctx);
   assert.equal(await h.settle(), undefined);
   assert.equal(h.calls.models.length, 0);
+});
+
+test("saving config mid-run does not disable fallback for later failures", async () => {
+  const h = await createHarness();
+  const tool = h.tools.get("model_fallback_config");
+  assert.equal(typeof tool?.execute, "function");
+  await tool.execute("save-1", { action: "save", configJson: JSON.stringify({ version: 1, enabled: true, autoRetry: true, rules: [rule(SOURCE, FALLBACK)] }) }, undefined, undefined, h.ctx);
+  await h.fail();
+  assert.equal((await h.settle()).continue, true);
+  assert.deepEqual(h.calls.models, [refModel(FALLBACK)]);
 });
 
 test("shutdown removes the terminal listener and pending work", async () => {

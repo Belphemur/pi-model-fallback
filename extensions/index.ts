@@ -48,6 +48,12 @@ export default function modelFallback(pi: ExtensionAPI) {
 
   function cancelFallback(): void {
     cancelled = true;
+    invalidatePending();
+  }
+
+  // Drop fallback work computed from superseded state without disabling fallback
+  // for the rest of the run (unlike cancelFallback).
+  function invalidatePending(): void {
     generation += 1;
     pendingFailure = undefined;
   }
@@ -366,7 +372,7 @@ export default function modelFallback(pi: ExtensionAPI) {
       if (!ctx.hasUI) return textResult("Config not saved: confirmation UI is unavailable.", { configPath: paths.config, ...warningDetails(warnings) });
       const ok = await ctx.ui.confirm("Save model fallback config?", summarizeConfig(nextConfig, warnings));
       if (!ok) return textResult("Config not saved.", { configPath: paths.config, ...warningDetails(warnings) });
-      cancelFallback();
+      invalidatePending();
       await writeConfig(paths.config, nextConfig);
       config = nextConfig;
       return textResult(configResultText("Config saved.", warnings), { configPath: paths.config, ...warningDetails(warnings) });
