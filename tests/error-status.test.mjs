@@ -92,6 +92,35 @@ test("parseStatusFromErrorMessage extracts a parenthesized status inside an erro
   assert.equal(parseStatusFromErrorMessage("(50300) processed"), undefined);
 });
 
+test("parseStatusFromErrorMessage recognizes Anthropic SDK status plus JSON", () => {
+  assert.equal(parseStatusFromErrorMessage('429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}'), 429);
+  assert.equal(parseStatusFromErrorMessage('529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'), 529);
+  assert.equal(parseStatusFromErrorMessage('401 {"type":"error","error":{"type":"authentication_error","message":"Invalid credentials"}}'), 401);
+  assert.equal(parseStatusFromErrorMessage("429 tokens remaining"), undefined);
+});
+
+test("parseStatusFromErrorMessage recognizes Anthropic streaming errors", () => {
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'), 529);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}'), 429);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":{"type":"api_error","message":"Internal error"}}'), 500);
+  assert.equal(parseStatusFromErrorMessage("Anthropic stream ended before message_stop"), 502);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":{"type":"authentication_error"}}'), undefined);
+  assert.equal(parseStatusFromErrorMessage('{"type":"message","error":{"type":"overloaded_error"}}'), undefined);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":"overloaded_error"}'), undefined);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":null}'), undefined);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":'), undefined);
+});
+
+test("parseStatusFromErrorMessage recognizes transport failures but not cancellation", () => {
+  for (const message of ["Connection error.", "Request timed out.", "fetch failed", "connect ECONNRESET", "connect ECONNREFUSED", "lookup ENOTFOUND", "lookup EAI_AGAIN", "connect ETIMEDOUT"]) {
+    assert.equal(parseStatusFromErrorMessage(message), 503, message);
+  }
+  assert.equal(parseStatusFromErrorMessage("Request was aborted"), undefined);
+  assert.equal(parseStatusFromErrorMessage("Operation aborted"), undefined);
+  assert.equal(parseStatusFromErrorMessage("401: Unauthorized"), 401);
+  assert.equal(parseStatusFromErrorMessage("HTTP 429: connect ECONNRESET"), 429);
+});
+
 test("parseReasonFromErrorMessage extracts quoted provider error codes", () => {
   assert.equal(
     parseReasonFromErrorMessage(

@@ -1,258 +1,198 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createJiti } from "jiti";
+import { KeybindingsManager, setKeybindings } from "@earendil-works/pi-tui";
 
-// The extension imports TS files via ".js" specifiers, which pi resolves through jiti.
-// jiti is a transitive dependency of the pi installation rather than of this repo.
-async function loadJiti() {
-  try {
-    return await import("jiti");
-  } catch {
-    const { homedir } = await import("node:os");
-    return await import(join(homedir(), ".pi", "agent", "npm", "node_modules", "jiti", "lib", "jiti.mjs"));
-  }
-}
-const { createJiti } = await loadJiti();
-const jiti = createJiti(import.meta.url);
-const modelFallback = (await jiti.import("../extensions/index.ts")).default;
+setKeybindings(new KeybindingsManager({ "app.interrupt": { defaultKeys: "escape", description: "Interrupt" } }));
+const modelFallback = (await createJiti(import.meta.url).import("../extensions/index.ts")).default;
+const SOURCE = { provider: "fixture", model: "source" };
+const FALLBACK = { provider: "fixture", model: "fallback" };
+const NEXT = { provider: "fixture", model: "third" };
+const refModel = ({ provider, model }) => ({ provider, id: model });
+const rule = (from, to) => ({ matchModels: [from], statuses: [429, 529], fallback: to });
 
-const SOURCE = { provider: "opencode-go", model: "glm-5.3-flash" };
-const FALLBACK = { provider: "openrouter", model: "poolside/laguna-xs-2.1:free" };
-const SOURCE_KEY = `${SOURCE.provider}/${SOURCE.model}`;
-const FALLBACK_KEY = `${FALLBACK.provider}/${FALLBACK.model}`;
-
-async function makeProject(rules) {
-  const cwd = await mkdtemp(join(tmpdir(), "pi-model-fallback-auto-retry-"));
-  await mkdir(join(cwd, ".pi"), { recursive: true });
-  // Project-local state so tests never touch the real agent directory.
-  await writeFile(join(cwd, ".pi", "settings.json"), JSON.stringify({ packages: ["pi-model-fallback"] }), "utf8");
-  const configPath = join(cwd, ".pi", "model-fallback", "config.json");
-  const statePath = join(cwd, ".pi", "model-fallback", "state.json");
-  await mkdir(join(cwd, ".pi", "model-fallback"), { recursive: true });
-  await writeFile(
-    configPath,
-    JSON.stringify({
-      version: 1,
-      enabled: true,
-      autoRetry: true,
-      rules: rules ?? [
-        {
-          name: "opencode-go-to-laguna-free",
-          matchProviders: ["opencode-go"],
-          statuses: [401, 402, 403, 429, 500, 502, 503, 504],
-          fallback: FALLBACK,
-        },
-      ],
-    }),
-    "utf8",
-  );
-  return { cwd, configPath, statePath };
-}
-
-function createHarness(cwd, { entries = [] } = {}) {
+async function createHarness({ rules = [rule(SOURCE, FALLBACK)], autoRetry = true, switchModel, preselect = false } = {}) {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-model-fallback-boundary-"));
+  const root = join(cwd, ".pi", "model-fallback");
+  await mkdir(root, { recursive: true });
+  await writeFile(join(cwd, ".pi", "settings.json"), JSON.stringify({ packages: ["pi-model-fallback"] }));
+  await writeFile(join(root, "config.json"), JSON.stringify({ version: 1, enabled: true, autoRetry, rules }));
+  if (preselect) await writeFile(join(root, "state.json"), JSON.stringify({ version: 1, entries: [{ source: SOURCE, fallback: FALLBACK, status: 429, until: new Date(Date.now() + 3600000).toISOString(), createdAt: new Date().toISOString() }] }));
   const handlers = new Map();
-  const calls = { setModel: [], sendUserMessage: [], notifications: [] };
+  const calls = { models: [], prompts: [], notifications: [] };
+  const tools = new Map();
+  let terminalInput;
+  let ctx;
+  let serial = 0;
+  const entries = [{ type: "message", id: "user", message: { role: "user", content: "finish the existing work" } }];
   const pi = {
-    on(type, handler) {
-      handlers.set(type, handler);
-    },
-    registerCommand() {},
-    registerTool() {},
+    on(type, handler) { handlers.set(type, handler); },
+    registerCommand() {}, registerTool(tool) { tools.set(tool.name, tool); },
     async setModel(model) {
-      calls.setModel.push(model);
+      if (switchModel && !(await switchModel(model))) return false;
+      calls.models.push(model);
+      const previousModel = ctx.model;
+      ctx.model = model;
+      await handlers.get("model_select")?.({ model, previousModel, source: "set" }, ctx);
       return true;
     },
-    async sendUserMessage(text, options) {
-      calls.sendUserMessage.push({ text, options });
+    sendUserMessage(...args) { calls.prompts.push(args); },
+  };
+  ctx = {
+    cwd, mode: "tui", hasUI: true, model: refModel(SOURCE),
+    modelRegistry: { find: (provider, id) => ({ provider, id }) },
+    ui: {
+      notify: (message, level) => calls.notifications.push({ message, level }), setStatus() {},
+      confirm: async () => true,
+      onTerminalInput(handler) { terminalInput = handler; return () => { terminalInput = undefined; }; },
     },
+    sessionManager: { getBranch: () => entries, getEntries: () => entries },
   };
   modelFallback(pi);
-  const ctx = {
-    cwd,
-    hasUI: true,
-    model: { provider: SOURCE.provider, id: SOURCE.model },
-    modelRegistry: {
-      find: (provider, id) => ({ provider, id }),
-    },
-    ui: {
-      notify: (message, level) => calls.notifications.push({ message, level }),
-      setStatus() {},
-      confirm: async () => true,
-    },
-    sessionManager: {
-      getEntries: () => entries,
-    },
-  };
-  return { pi, handlers, calls, ctx };
+  await handlers.get("session_start")?.({}, ctx);
+  async function start() { await handlers.get("before_agent_start")?.({ prompt: "finish the existing work" }, ctx); }
+  await start();
+  async function fail(errorMessage = "Error: 429 quota exceeded") {
+    const message = { role: "assistant", provider: ctx.model.provider, model: ctx.model.id, stopReason: "error", errorMessage, content: [] };
+    const entry = { type: "message", id: `error-${++serial}`, message };
+    entries.push(entry);
+    await handlers.get("turn_end")?.({ message, messageEntryId: entry.id }, ctx);
+    return entry;
+  }
+  async function settle(outcome = "error") {
+    const handler = handlers.get("agent_before_settle");
+    assert.equal(typeof handler, "function", "fallback must use Pi's actionable settle boundary");
+    return handler({ outcome, entries: [], continue: false, context: { contextEntries: entries.map(entry => ({ sourceEntry: entry, messages: [entry.message] })), pendingMessages: [], canContinue: false } }, ctx);
+  }
+  return { calls, ctx, entries, handlers, fail, settle, start, tools, escape: () => terminalInput?.("\u001b"), statePath: join(root, "state.json") };
 }
 
-async function seedPersistent401(statePath) {
-  await mkdir(statePath.replace(/[/\\][^/\\]+$/, ""), { recursive: true });
-  await writeFile(
-    statePath,
-    JSON.stringify({
-      version: 1,
-      entries: [
-        {
-          source: SOURCE,
-          fallback: FALLBACK,
-          status: 401,
-          until: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-          createdAt: new Date(Date.now() - 60 * 1000).toISOString(),
-          ruleName: "opencode-go-to-laguna-free",
-        },
-      ],
-    }),
-    "utf8",
-  );
-}
-
-const creditsErrorAssistantMessage = {
-  role: "assistant",
-  provider: SOURCE.provider,
-  model: SOURCE.model,
-  errorMessage: `Error: 401: {"type":"CreditsError","message":"Insufficient balance."}`,
-};
-
-test("auto-retries failed prompt on preselected fallback when the original model 401s", async () => {
-  const project = await makeProject();
-  await seedPersistent401(project.statePath);
-  const harness = createHarness(project.cwd, {
-    entries: [{ message: { role: "user", content: "hello there" } }],
-  });
-
-  await harness.handlers.get("agent_start")(undefined, harness.ctx);
-  assert.deepEqual(harness.calls.setModel, [{ provider: FALLBACK.provider, id: FALLBACK.model }], "agent_start preselects the fallback model");
-
-  await harness.handlers.get("turn_end")({ message: creditsErrorAssistantMessage }, harness.ctx);
-
-  assert.equal(harness.calls.sendUserMessage.length, 1, "failed prompt should be retried on the fallback");
-  assert.equal(harness.calls.sendUserMessage[0].text, "hello there");
-  assert.deepEqual(harness.calls.sendUserMessage[0].options, { deliverAs: "followUp" });
-
-  const state = JSON.parse(await readFile(project.statePath, "utf8"));
-  assert.equal(state.entries.length, 1);
-  assert.equal(state.entries[0].status, 401);
+test("a failure switches only at settlement and continues without a second user request", async () => {
+  const h = await createHarness();
+  const failed = await h.fail();
+  assert.equal(h.calls.models.length, 0, "do not interfere with core retries");
+  assert.deepEqual(await h.settle(), { entries: [{ type: "context_edit", targetId: failed.id, replacement: null }], continue: true });
+  assert.deepEqual(h.calls.models, [refModel(FALLBACK)]);
+  assert.equal(h.calls.prompts.length, 0);
+  const state = JSON.parse(await readFile(h.statePath, "utf8"));
+  assert.deepEqual(state.entries[0].source, SOURCE);
+  assert.deepEqual(state.entries[0].fallback, FALLBACK);
 });
 
-test("does not auto-retry when the fallback fails and no rule matches it", async () => {
-  const project = await makeProject();
-  await seedPersistent401(project.statePath);
-  const harness = createHarness(project.cwd, {
-    entries: [{ message: { role: "user", content: "hello there" } }],
-  });
-
-  await harness.handlers.get("agent_start")(undefined, harness.ctx);
-
-  // The fallback model itself fails, but the config has no rule matching it, so there is
-  // nowhere further to cascade.
-  await harness.handlers.get("turn_end")(
-    {
-      message: {
-        role: "assistant",
-        provider: FALLBACK.provider,
-        model: FALLBACK.model,
-        errorMessage: "Error: 429: {\"type\":\"RateLimitError\",\"message\":\"Too many requests\"}",
-      },
-    },
-    harness.ctx,
-  );
-
-  assert.equal(harness.calls.sendUserMessage.length, 0, "a failing fallback with no matching rule must not trigger another retry");
+test("finite cascade survives agent_start continuation events without revisiting failed models", async () => {
+  const h = await createHarness({ rules: [rule(SOURCE, FALLBACK), rule(FALLBACK, NEXT), rule(NEXT, SOURCE)] });
+  await h.fail();
+  assert.equal((await h.settle()).continue, true);
+  await h.handlers.get("agent_start")?.({}, h.ctx);
+  await h.fail();
+  assert.equal((await h.settle()).continue, true);
+  await h.fail();
+  assert.equal(await h.settle(), undefined);
+  assert.deepEqual(h.calls.models, [refModel(FALLBACK), refModel(NEXT)]);
+  assert.equal(h.calls.prompts.length, 0);
 });
 
-test("cascades to the next rule when the active fallback itself fails", async () => {
-  const NEXT = { provider: "openrouter", model: "z-ai/glm-5.3-flash" };
-  const project = await makeProject([
-    {
-      name: "opencode-go-to-laguna-free",
-      matchProviders: ["opencode-go"],
-      statuses: [401, 402, 403, 429, 500, 502, 503, 504],
-      fallback: FALLBACK,
-    },
-    {
-      name: "laguna-free-to-glm-flash",
-      matchModels: [FALLBACK],
-      statuses: [401, 402, 403, 429, 500, 502, 503, 504],
-      fallback: NEXT,
-    },
-  ]);
-  await seedPersistent401(project.statePath);
-  const harness = createHarness(project.cwd, {
-    entries: [{ message: { role: "user", content: "hello there" } }],
-  });
-
-  await harness.handlers.get("agent_start")(undefined, harness.ctx);
-  assert.deepEqual(harness.calls.setModel, [{ provider: FALLBACK.provider, id: FALLBACK.model }], "agent_start preselects the first fallback");
-
-  // The preselected fallback itself fails 429: the second rule must cascade onward.
-  await harness.handlers.get("turn_end")(
-    {
-      message: {
-        role: "assistant",
-        provider: FALLBACK.provider,
-        model: FALLBACK.model,
-        errorMessage: "Error: 429: {\"type\":\"RateLimitError\",\"message\":\"Too many requests\"}",
-      },
-    },
-    harness.ctx,
-  );
-
-  assert.deepEqual(
-    harness.calls.setModel.at(-1),
-    { provider: NEXT.provider, id: NEXT.model },
-    "cascade switches to the second fallback",
-  );
-  assert.equal(harness.calls.sendUserMessage.length, 1, "failed prompt should be retried on the cascaded fallback");
-
-  const state = JSON.parse(await readFile(project.statePath, "utf8"));
-  assert.equal(state.entries.length, 2);
-  const cascadeEntry = state.entries.find((entry) => entry.ruleName === "laguna-free-to-glm-flash");
-  assert.ok(cascadeEntry, "cascade failure persisted");
-  assert.deepEqual(cascadeEntry.fallback, NEXT);
+test("persistent preselection still allows an onward fallback but not a return to the source", async () => {
+  const h = await createHarness({ preselect: true, rules: [rule(SOURCE, FALLBACK), rule(FALLBACK, NEXT), rule(NEXT, SOURCE)] });
+  assert.deepEqual(h.calls.models, [refModel(FALLBACK)]);
+  await h.fail();
+  assert.equal((await h.settle()).continue, true);
+  await h.fail();
+  assert.equal(await h.settle(), undefined);
+  assert.deepEqual(h.calls.models, [refModel(FALLBACK), refModel(NEXT)]);
 });
 
-test("circular rules do not ping-pong: cascade back to the original model is blocked", async () => {
-  const project = await makeProject([
-    {
-      name: "opencode-go-to-laguna-free",
-      matchProviders: ["opencode-go"],
-      statuses: [401, 402, 403, 429, 500, 502, 503, 504],
-      fallback: FALLBACK,
-    },
-    {
-      name: "laguna-free-back-to-opencode-go",
-      matchModels: [FALLBACK],
-      statuses: [401, 402, 403, 429, 500, 502, 503, 504],
-      fallback: SOURCE,
-    },
-  ]);
-  await seedPersistent401(project.statePath);
-  const harness = createHarness(project.cwd, {
-    entries: [{ message: { role: "user", content: "hello there" } }],
-  });
+test("response metadata keeps retry headers without switching before settlement", async () => {
+  const h = await createHarness();
+  await h.handlers.get("after_provider_response")({ status: 429, headers: { "retry-after": "60" } }, h.ctx);
+  assert.equal(h.calls.models.length, 0);
+  await h.fail("You have hit your usage limit.");
+  await h.settle();
+  const { entries } = JSON.parse(await readFile(h.statePath, "utf8"));
+  assert.ok(Date.parse(entries[0].until) - Date.parse(entries[0].createdAt) <= 61000);
+});
 
-  await harness.handlers.get("agent_start")(undefined, harness.ctx);
+test("response status cannot cross models or provider requests", async () => {
+  const h = await createHarness({ rules: [rule(SOURCE, FALLBACK), rule(FALLBACK, NEXT)] });
+  await h.handlers.get("after_provider_response")({ status: 429, headers: {} }, h.ctx);
+  h.ctx.model = refModel(FALLBACK);
+  await h.fail("Unclassified provider error");
+  assert.equal(await h.settle(), undefined);
+  await h.handlers.get("after_provider_response")({ status: 429, headers: {} }, h.ctx);
+  await h.handlers.get("before_provider_request")({}, h.ctx);
+  await h.fail("Unclassified provider error");
+  assert.equal(await h.settle(), undefined);
+  assert.equal(h.calls.models.length, 0);
+});
 
-  // The preselected fallback fails, and its only rule targets the original model (circular).
-  await harness.handlers.get("turn_end")(
-    {
-      message: {
-        role: "assistant",
-        provider: FALLBACK.provider,
-        model: FALLBACK.model,
-        errorMessage: "Error: 429: {\"type\":\"RateLimitError\",\"message\":\"Too many requests\"}",
-      },
-    },
-    harness.ctx,
-  );
+test("interrupt during core retry suppresses fallback even if settlement remains an error", async () => {
+  const h = await createHarness();
+  await h.fail(); h.escape();
+  assert.equal(await h.settle(), undefined);
+  assert.equal(h.calls.models.length, 0);
+  await h.start(); await h.fail();
+  assert.equal((await h.settle()).continue, true);
+});
 
-  assert.equal(
-    harness.calls.setModel.filter((m) => `${m.provider}/${m.id}` === SOURCE_KEY).length,
-    0,
-    "circular fallback to the original model must be blocked",
-  );
-  assert.equal(harness.calls.sendUserMessage.length, 0, "no retry when the cascade is blocked");
+test("aborted settlement never switches or resumes", async () => {
+  const h = await createHarness(); await h.fail();
+  assert.equal(await h.settle("aborted"), undefined);
+  assert.equal(h.calls.models.length, 0);
+});
+
+test("interrupt while target activation is pending prevents continuation and persistence", async () => {
+  let release, entered;
+  const reached = new Promise(resolve => { entered = resolve; });
+  const h = await createHarness({ switchModel: () => { entered(); return new Promise(resolve => { release = resolve; }); } });
+  await h.fail(); const settling = h.settle();
+  await Promise.race([reached, settling]); h.escape(); release(true);
+  assert.equal(await settling, undefined);
+  assert.equal(existsSync(h.statePath), false);
+});
+
+test("successful retry clears the old failure", async () => {
+  const h = await createHarness(); await h.fail();
+  await h.handlers.get("turn_end")({ message: { role: "assistant", stopReason: "stop" }, messageEntryId: "ok" }, h.ctx);
+  assert.equal(await h.settle("completed"), undefined);
+  assert.equal(h.calls.models.length, 0);
+});
+
+test("unavailable target stops without persisting or replaying", async () => {
+  const h = await createHarness({ switchModel: async () => false }); await h.fail();
+  assert.equal(await h.settle(), undefined);
+  assert.equal(existsSync(h.statePath), false);
+  assert.equal(h.calls.prompts.length, 0);
+});
+
+test("autoRetry false switches the model without continuing", async () => {
+  const h = await createHarness({ autoRetry: false }); await h.fail();
+  assert.equal(await h.settle(), undefined);
+  assert.deepEqual(h.calls.models, [refModel(FALLBACK)]);
+});
+
+test("manual selection cancels pending fallback", async () => {
+  const h = await createHarness(); await h.fail(); h.ctx.model = refModel(NEXT);
+  await h.handlers.get("model_select")({ model: h.ctx.model, source: "set" }, h.ctx);
+  assert.equal(await h.settle(), undefined);
+  assert.equal(h.calls.models.length, 0);
+});
+
+test("saving config mid-run does not disable fallback for later failures", async () => {
+  const h = await createHarness();
+  const tool = h.tools.get("model_fallback_config");
+  assert.equal(typeof tool?.execute, "function");
+  await tool.execute("save-1", { action: "save", configJson: JSON.stringify({ version: 1, enabled: true, autoRetry: true, rules: [rule(SOURCE, FALLBACK)] }) }, undefined, undefined, h.ctx);
+  await h.fail();
+  assert.equal((await h.settle()).continue, true);
+  assert.deepEqual(h.calls.models, [refModel(FALLBACK)]);
+});
+
+test("shutdown removes the terminal listener and pending work", async () => {
+  const h = await createHarness(); await h.fail();
+  await h.handlers.get("session_shutdown")({}, h.ctx); h.escape();
+  assert.equal(await h.settle(), undefined);
 });

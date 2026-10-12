@@ -1,3 +1,5 @@
+import { isRecord } from "./internal.ts";
+
 const REASON_TEXT_PATTERNS: Array<[RegExp, string]> = [
   [/exceeds\s+(?:this|the)\s+model'?s?\s+context\s+length/i, "context_length_exceeded"],
   [/context[\s_-]*length[\s_-]*exceeded/i, "context_length_exceeded"],
@@ -27,9 +29,24 @@ const EMPTY_PROVIDER_RESPONSE_PATTERNS: RegExp[] = [
   /response (has|with) no body/i,
   /stream ended without a terminal event/i,
   /stream ended without finish_reason/i,
+  /^Anthropic stream ended before message_stop$/,
 ];
 
 export function parseStatusFromErrorMessage(message: string): number | undefined {
+  if (message.trimStart().startsWith("{")) {
+    try {
+      const payload: unknown = JSON.parse(message);
+      if (isRecord(payload) && payload.type === "error" && isRecord(payload.error)) {
+        switch (payload.error.type) {
+          case "overloaded_error": return 529;
+          case "rate_limit_error": return 429;
+          case "api_error": return 500;
+        }
+      }
+    } catch {
+      // Non-JSON error text still uses the status patterns below.
+    }
+  }
   for (const pattern of EMPTY_PROVIDER_RESPONSE_PATTERNS) {
     if (pattern.test(message)) {
       // Synthesize 502 so status-based fallback rules fire instead of the
@@ -40,9 +57,8 @@ export function parseStatusFromErrorMessage(message: string): number | undefined
     }
   }
   const patterns: RegExp[] = [
-    // Leading bare status code, optionally prefixed with "Error:", e.g. "401: {\"type\":\"CreditsError\"...}"
-    // or "Error: 401: {\"type\":\"CreditsError\"...}" (OpenCode Go, OpenRouter relays)
-    /^\s*(?:error\s*:?\s*)?([1-5][0-9]{2})\s*:/i,
+    // SDKs use either "429: ..." or "429 {JSON}"; keep ordinary numeric prose unmatched.
+    /^\s*(?:error\s*:?\s*)?([1-5][0-9]{2})(?:\s*:|\s+(?=\{))/i,
     // Anchored "Error: <status> <prose>", e.g. "Error: 429 quota exceeded"
     // (GitHub Copilot). The pattern above needs a colon AFTER the status and the
     // "error <status>" pattern below needs whitespace directly after "error", so
@@ -71,5 +87,8 @@ export function parseStatusFromErrorMessage(message: string): number | undefined
     if (Number.isInteger(status) && status >= 100 && status <= 599) return status;
   }
 
+  // Connection failures have no HTTP response; use the existing unavailable-service rules.
+  if (/^\s*(?:error:\s*)?(?:connection error|request timed out|fetch failed)[.!]?\s*$/i.test(message) ||
+      /\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT)\b/.test(message)) return 503;
   return undefined;
 }
