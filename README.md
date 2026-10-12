@@ -26,6 +26,8 @@ When a failure matches, the extension also stores persistent fallback state so f
 
 ## Install
 
+Requires Pi 1.1 or later for the continuation boundary API.
+
 Install from npm:
 
 ```bash
@@ -97,7 +99,7 @@ Rule fields:
 Top-level fields:
 
 - `enabled`: toggle the extension without deleting rules
-- `autoRetry`: when a fallback fires from a failed turn, automatically re-queue the failed user prompt so the turn retries on the fallback model (defaults to `true`; set to `false` to only switch models). The failed prompt is queued once per fallback transition, so a fallback chain may replay it more than once.
+- `autoRetry`: after Pi exhausts its own retries, continue the existing conversation on the fallback model without re-queueing the user prompt (defaults to `true`; set to `false` to only switch models). Completed tool results and image inputs remain in context; only the failed assistant entry is excluded.
 
 Rules use first-match order: the first rule whose provider/model and status match wins. Put specific `matchModels` rules before broad `matchProviders` rules when they should take priority. `model_fallback_config validate`, `save`, `read`, and `status` report warning-only diagnostics when a later rule or model entry is completely shadowed by an earlier rule; `/model-fallback:status` also includes a concise warning summary for the current config. Warning-bearing config remains valid and can still be saved.
 
@@ -122,9 +124,11 @@ If the package is installed project-locally and the current project references i
 ## Behavior notes
 
 - Successful responses do nothing.
-- Matching failures from `after_provider_response` can trigger fallback immediately.
-- Assistant error messages parsed at `turn_end` can also persist fallback state for SDK/provider failures that do not emit the normal response hook. Status extraction looks for HTTP-style tokens (for example `status 429`, `HTTP 503`, or `rate limit`) rather than any bare 3-digit number in the message. A status in parentheses is only recognized when an error wrapper keyword precedes it, as in `omni API error (503): ...`; a parenthesized number with no such wrapper, such as `(503) items processed`, stays unmatched.
-- With the default `autoRetry: true`, the failed prompt is automatically queued once per fallback transition on the fallback model. A fallback chain may therefore replay the prompt more than once. Set `autoRetry: false` to switch models without replaying it.
+- Failed HTTP responses are recorded by `after_provider_response`; model switching waits until Pi's retry/recovery paths finish at `agent_before_settle`.
+- Assistant error messages parsed at `turn_end` identify SDK/provider failures that do not emit the normal response hook. When friendly error text omits a status, the extension uses the observed HTTP status and headers from the same model request. Status extraction looks for HTTP-style tokens (for example `status 429`, `HTTP 503`, or `rate limit`) rather than any bare 3-digit number in the message. A status in parentheses is only recognized when an error wrapper keyword precedes it, as in `omni API error (503): ...`; a parenthesized number with no such wrapper, such as `(503) items processed`, stays unmatched.
+- With the default `autoRetry: true`, the existing run continues on the fallback model without a second user request. Set `autoRetry: false` to switch models without continuing.
+- Interrupting a pending fallback prevents continuation. An in-flight model change is not atomic with cancellation: the selected model may change, but the extension will not request another inference after the interrupt.
+- Switching providers sends the existing model context to the target provider. Preserving completed tool results prevents extension-level replay, not a model independently choosing to repeat an action.
 
 Rules never fall back to the failing model itself; a rule whose fallback target equals the failing model is skipped so the next matching rule (or no rule) applies.
 

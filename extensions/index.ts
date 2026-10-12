@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getKeybindings } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   analyzeRuleWarnings,
@@ -37,6 +38,39 @@ export default function modelFallback(pi: ExtensionAPI) {
   // target a model never visited, which makes chains (free → kimi → glm) safe while
   // preventing A→B→A ping-pong with circular rules.
   let visitedFallbackKeys = new Set<string>();
+  let cancelled = false;
+  let generation = 0;
+  let switching = false;
+  let uiPromptOpen = false;
+  let removeTerminalListener: (() => void) | undefined;
+  let responseFailure: { modelKey: string; status: number; headers: Record<string, string> } | undefined;
+  let pendingFailure: { source: ModelRef; status: number; reason?: string; entryId: string; headers: Record<string, string> } | undefined;
+
+  function cancelFallback(): void {
+    cancelled = true;
+    generation += 1;
+    pendingFailure = undefined;
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    removeTerminalListener?.();
+    if (ctx.mode === "tui") {
+      removeTerminalListener = ctx.ui.onTerminalInput((data) => {
+        if ((pendingFailure || switching) && !uiPromptOpen && getKeybindings().matches(data, "app.interrupt")) cancelFallback();
+        // Observe cancellation without consuming autocomplete, overlay, or editor input.
+        return undefined;
+      });
+    }
+  });
+  pi.on("ui_prompt_start", () => { uiPromptOpen = true; });
+  pi.on("ui_prompt_end", () => { uiPromptOpen = false; });
+  pi.on("session_shutdown", () => {
+    cancelFallback();
+    removeTerminalListener?.();
+    removeTerminalListener = undefined;
+  });
+  pi.on("session_before_switch", cancelFallback);
+  pi.on("session_before_tree", cancelFallback);
 
   function syncPaths(ctx: ExtensionContext): void {
     if (pathsResolvedForCwd === ctx.cwd) return;
@@ -103,7 +137,13 @@ export default function modelFallback(pi: ExtensionAPI) {
     visitedFallbackKeys = new Set([originalModelKey, activeFallbackKey]);
     lastFallbackReason = `persistent ${active.status} from ${originalModelKey} until ${active.until}`;
     updateStatus(ctx);
-    const ok = await pi.setModel(fallbackModel);
+    let ok = false;
+    switching = true;
+    try {
+      ok = await pi.setModel(fallbackModel);
+    } finally {
+      switching = false;
+    }
     if (!ok) {
       ctx.ui.notify(`Model fallback auth unavailable: ${modelRefKey(active.fallback)}`, "warning");
       originalModelKey = undefined;
@@ -117,7 +157,7 @@ export default function modelFallback(pi: ExtensionAPI) {
     ctx.ui.notify(`Model fallback preselected: ${originalModelKey} → ${activeFallbackKey} until ${active.until}.`, "warning");
   }
 
-  async function persistFailure(source: ModelRef, status: number, headers: Record<string, string>, ctx: ExtensionContext, reason?: string): Promise<boolean> {
+  async function persistFailure(source: ModelRef, status: number, headers: Record<string, string>, ctx: ExtensionContext, isCancelled: () => boolean, reason?: string): Promise<boolean> {
     const loaded = config ?? (await loadConfig(ctx));
     if (!loaded) return false;
     const match = findFallback(loaded, { provider: source.provider, id: source.model }, status, reason);
@@ -129,30 +169,12 @@ export default function modelFallback(pi: ExtensionAPI) {
       return false;
     }
 
-    // Loop guard: never fall back to a model already visited this run (the original or an
-    // earlier fallback). This both blocks circular rules from ping-ponging and stops the
-    // current fallback from re-selecting itself, while still allowing onward cascades
-    // (free → kimi → glm) when a different rule matches the fallback's own failure.
-    // Exception: when the failing model is the remembered original and the candidate is the
-    // already-preselected fallback, re-applying the same hop is idempotent and stays allowed
-    // (turn attribution can lag behind the preselection).
     const fallbackKey = modelRefKey(match.fallback);
     const sourceKey = modelRefKey(source);
-    const idempotentReapply = fallbackKey === activeFallbackKey && sourceKey === originalModelKey;
-    if (visitedFallbackKeys.has(fallbackKey) && !idempotentReapply) return false;
+    if (visitedFallbackKeys.has(fallbackKey) || isCancelled()) return false;
 
     const now = new Date();
     const until = new Date(now.getTime() + cooldownMsFor(match.rule.cooldownMs, status, headers)).toISOString();
-    const loadedState = state ?? (await loadState(ctx)) ?? { version: 1 as const, entries: [] };
-    state = upsertStateEntry(loadedState, {
-      source,
-      fallback: match.fallback,
-      status,
-      until,
-      createdAt: now.toISOString(),
-      ruleName: match.rule.name,
-    });
-    await writeState(paths.state, state);
 
     const prevOriginal = originalModelKey;
     const prevActive = activeFallbackKey;
@@ -167,30 +189,49 @@ export default function modelFallback(pi: ExtensionAPI) {
     lastFallbackReason = `${status} from ${sourceKey}${reason ? ` (${reason})` : ""}; persistent until ${until}`;
     updateStatus(ctx);
 
-    const ok = await pi.setModel(fallbackModel);
-    if (!ok) {
+    let ok = false;
+    try {
+      ok = await pi.setModel(fallbackModel);
+    } catch (error) {
+      ctx.ui.notify(`Model fallback switch failed: ${errorMessage(error)}`, "warning");
+    }
+    if (!ok || isCancelled()) {
       originalModelKey = prevOriginal;
       activeFallbackKey = prevActive;
       lastFallbackReason = prevReason;
       visitedFallbackKeys = prevVisited;
       updateStatus(ctx);
-      ctx.ui.notify(`Model fallback auth unavailable: ${modelRefKey(match.fallback)}`, "warning");
+      if (!ok) ctx.ui.notify(`Model fallback auth unavailable: ${modelRefKey(match.fallback)}`, "warning");
       return false;
     }
-    ctx.ui.notify(`Model fallback: ${originalModelKey} → ${activeFallbackKey} (${status}). Future sessions preselect fallback until ${until}.`, "warning");
+    const loadedState = state ?? (await loadState(ctx)) ?? emptyState();
+    if (isCancelled()) return false;
+    state = upsertStateEntry(loadedState, { source, fallback: match.fallback, status, until, createdAt: now.toISOString(), ruleName: match.rule.name });
+    await writeState(paths.state, state);
+    ctx.ui.notify(`Model fallback: ${sourceKey} → ${activeFallbackKey} (${status}). Future sessions preselect fallback until ${until}.`, "warning");
     return true;
   }
 
-  pi.on("agent_start", async (_event, ctx) => {
+  pi.on("before_agent_start", async (_event, ctx) => {
+    cancelled = false;
+    generation += 1;
+    pendingFailure = undefined;
+    responseFailure = undefined;
     await loadConfig(ctx);
     await loadState(ctx);
-    visitedFallbackKeys = new Set();
+    visitedFallbackKeys = new Set(ctx.model ? [modelKey(ctx.model)] : []);
     await applyPersistentFallback(ctx);
     updateStatus(ctx);
   });
 
+  pi.on("agent_start", (_event, ctx) => {
+    // Preselection happens before a run exists; abort once its controller is active.
+    if (cancelled) ctx.abort();
+  });
+
   pi.on("model_select", async (event, ctx) => {
-    if (activeFallbackKey && modelKey(event.model) !== activeFallbackKey) {
+    if (modelKey(event.model) !== activeFallbackKey) {
+      cancelFallback();
       activeFallbackKey = undefined;
       originalModelKey = undefined;
       lastFallbackReason = undefined;
@@ -199,34 +240,53 @@ export default function modelFallback(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("after_provider_response", async (event, ctx) => {
-    const current = ctx.model;
-    const loaded = config ?? (await loadConfig(ctx));
-    if (!current || !loaded) return;
-    if (event.status >= 200 && event.status < 300) return;
-
-    await persistFailure(modelToRef(current), event.status, event.headers, ctx);
+  pi.on("before_provider_request", () => { responseFailure = undefined; });
+  pi.on("after_provider_response", (event, ctx) => {
+    responseFailure = event.status >= 400 && ctx.model
+      ? { modelKey: modelKey(ctx.model), status: event.status, headers: event.headers }
+      : undefined;
   });
 
-  pi.on("turn_end", async (event, ctx) => {
-    const message = event.message as unknown;
-    if (!isRecord(message) || message.role !== "assistant") return;
-    const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
-    if (!errorMessage) return;
-    const status = parseStatusFromErrorMessage(errorMessage);
-    if (status === undefined) return;
-    const reason = parseReasonFromErrorMessage(errorMessage);
-    const provider = typeof message.provider === "string" ? message.provider : ctx.model?.provider;
-    const model = typeof message.model === "string" ? message.model : ctx.model?.id;
-    if (!provider || !model) return;
-    const switched = await persistFailure({ provider, model }, status, {}, ctx, reason);
-    if (!switched) return;
-    const loaded = config;
-    if (!loaded || loaded.autoRetry === false) return;
-    const prompt = lastUserPromptText(ctx);
-    if (!prompt) return;
-    ctx.ui.notify(`Model fallback: retrying failed prompt on ${activeFallbackKey}.`, "info");
-    await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  pi.on("turn_end", (event) => {
+    const response = responseFailure;
+    responseFailure = undefined;
+    pendingFailure = undefined;
+    const message = event.message;
+    if (message.role !== "assistant" || message.stopReason !== "error") return;
+    const source = { provider: message.provider, model: message.model };
+    const observed = response?.modelKey === modelRefKey(source) ? response : undefined;
+    const errorText = message.errorMessage ?? "";
+    const status = parseStatusFromErrorMessage(errorText) ?? observed?.status;
+    if (status !== undefined) {
+      pendingFailure = { source, status, reason: parseReasonFromErrorMessage(errorText),
+        entryId: event.messageEntryId, headers: observed?.headers ?? {} };
+    }
+  });
+
+  pi.on("agent_before_settle", async (event, ctx) => {
+    const failure = pendingFailure;
+    if (event.outcome !== "error" || cancelled || !failure || !ctx.model || modelKey(ctx.model) !== modelRefKey(failure.source)) return;
+    const visibleFailure = event.context.contextEntries.some((entry) => entry.sourceEntry.id === failure.entryId && entry.messages.some((message) => message.role === "assistant" && message.stopReason === "error"));
+    if (!visibleFailure && !event.context.canContinue) return;
+    pendingFailure = undefined;
+    const currentGeneration = generation;
+    const isCancelled = () => cancelled || generation !== currentGeneration;
+    switching = true;
+    try {
+      const switched = await persistFailure(failure.source, failure.status, failure.headers, ctx, isCancelled, failure.reason);
+      if (!switched || isCancelled() || config?.autoRetry === false) return;
+      return {
+        entries: visibleFailure ? [...event.entries, { type: "context_edit" as const, targetId: failure.entryId, replacement: null }] : event.entries,
+        continue: true,
+      };
+    } finally {
+      switching = false;
+    }
+  });
+
+  pi.on("agent_settled", () => {
+    pendingFailure = undefined;
+    responseFailure = undefined;
   });
 
   pi.registerCommand("model-fallback:status", {
@@ -241,6 +301,7 @@ export default function modelFallback(pi: ExtensionAPI) {
   pi.registerCommand("model-fallback:reset", {
     description: "Return from fallback model to the pre-fallback model when remembered and clear persistent state",
     handler: async (_args, ctx) => {
+      cancelFallback();
       syncPaths(ctx);
       state = { version: 1, entries: [] };
       await writeState(paths.state, state);
@@ -305,6 +366,7 @@ export default function modelFallback(pi: ExtensionAPI) {
       if (!ctx.hasUI) return textResult("Config not saved: confirmation UI is unavailable.", { configPath: paths.config, ...warningDetails(warnings) });
       const ok = await ctx.ui.confirm("Save model fallback config?", summarizeConfig(nextConfig, warnings));
       if (!ok) return textResult("Config not saved.", { configPath: paths.config, ...warningDetails(warnings) });
+      cancelFallback();
       await writeConfig(paths.config, nextConfig);
       config = nextConfig;
       return textResult(configResultText("Config saved.", warnings), { configPath: paths.config, ...warningDetails(warnings) });
@@ -314,29 +376,6 @@ export default function modelFallback(pi: ExtensionAPI) {
 
 function autoRetryEnabled(config: ModelFallbackConfig): boolean {
   return config.autoRetry !== false;
-}
-
-function lastUserPromptText(ctx: ExtensionContext): string | undefined {
-  const entries = ctx.sessionManager.getEntries() as unknown[];
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const entry = entries[index];
-    if (!isRecord(entry) || !isRecord(entry.message)) continue;
-    const message = entry.message;
-    if (message.role !== "user") continue;
-    return userMessageText(message.content);
-  }
-  return undefined;
-}
-
-function userMessageText(content: unknown): string | undefined {
-  if (typeof content === "string") return content.trim() || undefined;
-  if (!Array.isArray(content)) return undefined;
-  const parts: string[] = [];
-  for (const block of content) {
-    if (isRecord(block) && block.type === "text" && typeof block.text === "string") parts.push(block.text);
-  }
-  const text = parts.join("\n").trim();
-  return text || undefined;
 }
 
 function shouldUseProjectLocalState(ctx: ExtensionContext): boolean {

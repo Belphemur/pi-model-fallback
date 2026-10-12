@@ -24,7 +24,7 @@ export interface FallbackRule {
 export interface ModelFallbackConfig {
   version: 1;
   enabled: boolean;
-  /** Re-queue the failed user prompt after switching to the fallback model so the turn retries automatically. Defaults to true. */
+  /** Continue the existing conversation after switching without replaying the user prompt. Defaults to true. */
   autoRetry?: boolean;
   rules: FallbackRule[];
 }

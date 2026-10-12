@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- Require Pi 1.1 for the continuation boundary API and align Pi development dependencies with that release line.
+
+### Fixed
+
+- Continue failed requests after Pi's own retries without replaying the user prompt or dropping image inputs and completed tool results.
+- Keep fallback-chain visitation across continuation loops, respect interruption and aborted settlement, and persist cooldowns only after successful target activation.
+- Retain observed HTTP status and retry headers for the matching request when provider error text omits a status.
+
 ## [0.5.2] - 2026-10-07
 
 ### Changed
