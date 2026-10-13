@@ -44,7 +44,7 @@ export default function modelFallback(pi: ExtensionAPI) {
   let uiPromptOpen = false;
   let removeTerminalListener: (() => void) | undefined;
   let responseFailure: { modelKey: string; status: number; headers: Record<string, string> } | undefined;
-  let pendingFailure: { source: ModelRef; status: number; reason?: string; entryId: string; headers: Record<string, string> } | undefined;
+  let pendingFailure: { source: ModelRef; status: number; reason?: string; entryId: string; headers: Record<string, string>; retryExhausted?: boolean } | undefined;
 
   function cancelFallback(): void {
     cancelled = true;
@@ -258,20 +258,28 @@ export default function modelFallback(pi: ExtensionAPI) {
     responseFailure = undefined;
     pendingFailure = undefined;
     const message = event.message;
-    if (message.role !== "assistant" || message.stopReason !== "error") return;
+    if (message.role !== "assistant") return;
+    const errorText = message.errorMessage ?? "";
+    // Core retry loops surface exhaustion as stopReason "aborted" with an
+    // "Aborted after N retry attempts" marker instead of "error"; without
+    // accepting it here, a provider that fails on EVERY retry never reaches
+    // the fallback rules. Genuine user aborts carry no 4xx/5xx response, so
+    // the status lookup below keeps them inert.
+    const retryExhausted = message.stopReason === "aborted" && /aborted after \d+ retry attempts/i.test(errorText);
+    if (message.stopReason !== "error" && !retryExhausted) return;
     const source = { provider: message.provider, model: message.model };
     const observed = response?.modelKey === modelRefKey(source) ? response : undefined;
-    const errorText = message.errorMessage ?? "";
     const status = parseStatusFromErrorMessage(errorText) ?? observed?.status;
     if (status !== undefined) {
       pendingFailure = { source, status, reason: parseReasonFromErrorMessage(errorText),
-        entryId: event.messageEntryId, headers: observed?.headers ?? {} };
+        entryId: event.messageEntryId, headers: observed?.headers ?? {}, retryExhausted };
     }
   });
 
   pi.on("agent_before_settle", async (event, ctx) => {
     const failure = pendingFailure;
-    if (event.outcome !== "error" || cancelled || !failure || !ctx.model || modelKey(ctx.model) !== modelRefKey(failure.source)) return;
+    if (cancelled || !failure || !ctx.model || modelKey(ctx.model) !== modelRefKey(failure.source)) return;
+    if (event.outcome !== "error" && !failure.retryExhausted) return;
     const visibleFailure = event.context.contextEntries.some((entry) => entry.sourceEntry.id === failure.entryId && entry.messages.some((message) => message.role === "assistant" && message.stopReason === "error"));
     if (!visibleFailure && !event.context.canContinue) return;
     pendingFailure = undefined;
@@ -281,8 +289,17 @@ export default function modelFallback(pi: ExtensionAPI) {
     try {
       const switched = await persistFailure(failure.source, failure.status, failure.headers, ctx, isCancelled, failure.reason);
       if (!switched || isCancelled() || config?.autoRetry === false) return;
+      let targetId = failure.entryId;
+      if (failure.retryExhausted && !visibleFailure) {
+        // Retry-exhausted aborts: the turn's final entry is the "aborted"
+        // marker, so anchor the context cleanup to the last real error entry
+        // the retry loop produced.
+        for (const entry of event.context.contextEntries) {
+          if (entry.messages.some((message) => message.role === "assistant" && message.stopReason === "error")) targetId = entry.sourceEntry.id;
+        }
+      }
       return {
-        entries: visibleFailure ? [...event.entries, { type: "context_edit" as const, targetId: failure.entryId, replacement: null }] : event.entries,
+        entries: visibleFailure || targetId !== failure.entryId ? [...event.entries, { type: "context_edit" as const, targetId, replacement: null }] : event.entries,
         continue: true,
       };
     } finally {

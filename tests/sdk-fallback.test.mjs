@@ -204,3 +204,35 @@ test("SDK abort during target activation cannot start a fallback inference", { t
   assert.equal(h.target.state.callCount, 0);
   assert.equal(h.session.isIdle, true);
 });
+
+test("fallback fires when core retry exhaustion ends the turn aborted", { timeout: 10000 }, async (t) => {
+  const h = await fixture(t);
+  // Simulate the SDK >= 1.2 retry-exhaustion shape: every provider call fails
+  // with 429, then the run settles as stopReason "aborted" with the
+  // "Aborted after N retry attempts" marker instead of "error".
+  await h.session.extensionRunner.emit({ type: "after_provider_response", status: 429, headers: {} });
+  const aborted = { ...fauxAssistantMessage("", { stopReason: "aborted", errorMessage: "Aborted after 3 retry attempts" }), provider: "fixture-source", model: "source" };
+  await h.session.extensionRunner.emit({ type: "turn_end", turnIndex: 0, message: aborted, toolResults: [], messageEntryId: "entry-abort-1", toolResultEntryIds: [] });
+  await h.session.extensionRunner.emit({
+    type: "agent_before_settle",
+    entries: [],
+    continue: false,
+    outcome: "aborted",
+    context: { contextEntries: [{ sourceEntry: { id: "entry-abort-1" }, messages: [aborted] }], canContinue: true },
+  });
+  assert.equal(h.session.model.provider, "fixture-target", "fallback must consult the rules on retry-exhausted aborts");
+});
+
+test("a plain user abort without an observed failure never triggers fallback", { timeout: 10000 }, async (t) => {
+  const h = await fixture(t);
+  const aborted = { ...fauxAssistantMessage("", { stopReason: "aborted", errorMessage: "" }), provider: "fixture-source", model: "source" };
+  await h.session.extensionRunner.emit({ type: "turn_end", turnIndex: 0, message: aborted, toolResults: [], messageEntryId: "entry-abort-2", toolResultEntryIds: [] });
+  await h.session.extensionRunner.emit({
+    type: "agent_before_settle",
+    entries: [],
+    continue: false,
+    outcome: "aborted",
+    context: { contextEntries: [{ sourceEntry: { id: "entry-abort-2" }, messages: [aborted] }], canContinue: true },
+  });
+  assert.equal(h.session.model.provider, "fixture-source", "user aborts must keep the original model");
+});
