@@ -1,12 +1,14 @@
 # Usage
 
-Install:
+Requires Pi 1.1 or later. Install:
 
 ```bash
 pi install npm:pi-model-fallback
 ```
 
-Default behavior: when a `zai/*` model receives `429`, `500`, `502`, `503`, or `504`, Pi switches to `deepseek/deepseek-v4-flash` for the next prompt. The failed prompt is automatically queued once per fallback transition on the fallback model, so a fallback chain may replay it more than once; set `"autoRetry": false` in `model-fallback/config.json` to switch models without retrying it.
+Default behavior: when a `zai/*` model fails with `429`, `500`, `502`, `503`, or `504`, Pi finishes its own retries, switches to `deepseek/deepseek-v4-flash`, and continues the existing conversation without replaying the user prompt. Completed tool results and images remain in context. Set `"autoRetry": false` in `model-fallback/config.json` to switch models without continuing.
+
+The selected session model changes; subsequent requests use that model directly. Interrupting a pending fallback prevents continuation, although a model change already in progress may remain. A chain never revisits a model within the same user run.
 
 Commands:
 
@@ -26,4 +28,4 @@ Cooldown defaults when a rule omits `cooldownMs`:
 
 `Retry-After` and `x-ratelimit-reset*` response headers override `cooldownMs` and those defaults.
 
-If `autoRetry` is disabled, the failed request is not automatically replayed.
+If `autoRetry` is disabled, the existing run is not automatically continued.

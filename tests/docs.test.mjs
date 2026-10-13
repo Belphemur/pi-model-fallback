@@ -10,7 +10,8 @@ const packageJson = JSON.parse(await readFile(new URL("../package.json", import.
 test("usage docs describe the current retry behavior", () => {
   assert.doesNotMatch(usageMd, /v0\.1\.0/);
   assert.doesNotMatch(usageMd, /replayed in v\d/i);
-  assert.match(usageMd, /automatically queued once/i);
+  assert.match(usageMd, /continues the existing conversation without replaying the user prompt/i);
+  assert.match(usageMd, /Pi 1\.1 or later/i);
   assert.match(usageMd, /autoRetry.*false/i);
 });
 

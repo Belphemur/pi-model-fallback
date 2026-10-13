@@ -1,6 +1,34 @@
 # Changelog
 
-## Unreleased
+## [0.5.3] - 2026-10-12
+
+### Changed
+
+- Require Pi 1.1 for the continuation boundary API and align Pi development dependencies with that release line.
+
+### Fixed
+
+- Continue failed requests after Pi's own retries without replaying the user prompt or dropping image inputs and completed tool results.
+- Keep fallback-chain visitation across continuation loops, respect interruption and aborted settlement, and persist cooldowns only after successful target activation.
+- Retain observed HTTP status and retry headers for the matching request when provider error text omits a status.
+- Keep fallback active for the rest of the run after a config save mid-run; superseding pending fallback work no longer disables fallback until the next user prompt.
+- Recognize Anthropic SDK status-plus-JSON and streaming errors so configured rate-limit and outage rules are evaluated. Treat interrupted Anthropic streams as `502` and supported connection failures as `503`, without changing rule defaults or matching cancellation.
+
+## [0.5.2] - 2026-10-07
+
+### Changed
+
+- Update `@earendil-works/pi-*` development dependencies to `1.0.4`.
+
+### Fixed
+
+- Recognize a status in parentheses when a provider error wrapper precedes it, for example `omni API error (503): ...`. Previously such messages yielded no status, so rules listing `503` were never evaluated even when configured.
+
+## [0.5.1] - 2026-09-30
+
+### Changed
+
+- Update `@earendil-works/pi-*` dependencies to `0.99.1`.
 
 ## [0.5.0] - 2026-09-22
 

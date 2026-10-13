@@ -76,6 +76,51 @@ test("parseStatusFromErrorMessage ignores unrelated 3-digit numbers", () => {
   assert.equal(parseStatusFromErrorMessage("the 500 most recent errors were summarised"), undefined);
 });
 
+test("parseStatusFromErrorMessage extracts a parenthesized status inside an error wrapper", () => {
+  // Provider wrappers place the status between parentheses with the wrapper text
+  // in between, so both the anchored leading-status pattern and the
+  // "error <status>" pattern miss it and no rule ever sees a status.
+  assert.equal(parseStatusFromErrorMessage("omni API error (503): overloaded"), 503);
+  assert.equal(parseStatusFromErrorMessage("omni API error (503): service temporarily unavailable"), 503);
+  assert.equal(parseStatusFromErrorMessage("omni API error (500): internal error"), 500);
+  assert.equal(parseStatusFromErrorMessage("chat_completion_error (429): rate limited"), 429);
+  assert.equal(parseStatusFromErrorMessage("upstream_failure (502)"), 502);
+  assert.equal(parseStatusFromErrorMessage("omni API error (503):"), 503);
+  // Parentheses without the error/failure wrapper must not be treated as a status.
+  assert.equal(parseStatusFromErrorMessage("(503) items processed"), undefined);
+  assert.equal(parseStatusFromErrorMessage("(5 o3) malformed"), undefined);
+  assert.equal(parseStatusFromErrorMessage("(50300) processed"), undefined);
+});
+
+test("parseStatusFromErrorMessage recognizes Anthropic SDK status plus JSON", () => {
+  assert.equal(parseStatusFromErrorMessage('429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}'), 429);
+  assert.equal(parseStatusFromErrorMessage('529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'), 529);
+  assert.equal(parseStatusFromErrorMessage('401 {"type":"error","error":{"type":"authentication_error","message":"Invalid credentials"}}'), 401);
+  assert.equal(parseStatusFromErrorMessage("429 tokens remaining"), undefined);
+});
+
+test("parseStatusFromErrorMessage recognizes Anthropic streaming errors", () => {
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'), 529);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}'), 429);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":{"type":"api_error","message":"Internal error"}}'), 500);
+  assert.equal(parseStatusFromErrorMessage("Anthropic stream ended before message_stop"), 502);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":{"type":"authentication_error"}}'), undefined);
+  assert.equal(parseStatusFromErrorMessage('{"type":"message","error":{"type":"overloaded_error"}}'), undefined);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":"overloaded_error"}'), undefined);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":null}'), undefined);
+  assert.equal(parseStatusFromErrorMessage('{"type":"error","error":'), undefined);
+});
+
+test("parseStatusFromErrorMessage recognizes transport failures but not cancellation", () => {
+  for (const message of ["Connection error.", "Request timed out.", "fetch failed", "connect ECONNRESET", "connect ECONNREFUSED", "lookup ENOTFOUND", "lookup EAI_AGAIN", "connect ETIMEDOUT"]) {
+    assert.equal(parseStatusFromErrorMessage(message), 503, message);
+  }
+  assert.equal(parseStatusFromErrorMessage("Request was aborted"), undefined);
+  assert.equal(parseStatusFromErrorMessage("Operation aborted"), undefined);
+  assert.equal(parseStatusFromErrorMessage("401: Unauthorized"), 401);
+  assert.equal(parseStatusFromErrorMessage("HTTP 429: connect ECONNRESET"), 429);
+});
+
 test("parseReasonFromErrorMessage extracts quoted provider error codes", () => {
   assert.equal(
     parseReasonFromErrorMessage(
